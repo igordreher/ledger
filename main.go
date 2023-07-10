@@ -24,12 +24,12 @@ func main() {
 		dest := uuid.New()
 		log.Println(source.String())
 		amount := 100
-		_, err := conn.Exec(context.Background(), "insert into wallets (address) values ($1), ($2)", source, dest)
+		_, err := conn.Exec(context.Background(), "insert into wallets (address, negative_limit) values ($1, 50), ($2, 0)", source, dest)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		_, err = conn.Exec(context.Background(), "insert into accounts (balance, wallet_id) values($1, $2)", amount, source)
+		_, err = conn.Exec(context.Background(), "insert into accounts (balance, wallet_id) values($1, $2)", amount-50, source)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -53,22 +53,20 @@ func Transact(source, destination uuid.UUID, amount int /* TODO: what data type 
 		return errors.New("destination wallet doesn't exist")
 	}
 
-	var balance int
+	var total_source_balance int
 	{
-		// TODO: handle negative limit
-		sum_balance_sql := "select sum(balance) from wallets where address = $1 group by w.address"
-		// sum_balance_sql := "select sum(balance) + w.negative_limit from wallets w " +
-		// 	"join accounts a on a.wallet_id = w.address " +
-		// 	"where w.address = $1 group by w.address"
-		row := conn.QueryRow(context.Background(), sum_balance_sql, source.String())
-		err := row.Scan(&balance)
+		total_balance_sql := "select sum(a.balance) + w.negative_limit from wallets w " +
+			"join accounts a on a.wallet_id = w.address " +
+			"where w.address = $1 group by w.address"
+		row := conn.QueryRow(context.Background(), total_balance_sql, source.String())
+		err := row.Scan(&total_source_balance)
 		if err != nil {
 			return err
 		}
 	}
 
-	if balance < amount {
-		return errors.New("unsificient funds")
+	if total_source_balance < amount {
+		return errors.New("insufficient funds")
 	}
 
 	tx, err := conn.Begin(context.Background())
@@ -91,8 +89,11 @@ func Transact(source, destination uuid.UUID, amount int /* TODO: what data type 
 		}
 	}
 
-	var balances []int
-	var sources []uuid.UUID
+	type Account struct {
+		Address uuid.UUID
+		Balance int
+	}
+	var accounts []Account
 	{
 		select_accounts_sql := "select address, balance from accounts where wallet_id = $1 order by created asc"
 		rows, err := tx.Query(context.Background(), select_accounts_sql, source.String())
@@ -101,27 +102,29 @@ func Transact(source, destination uuid.UUID, amount int /* TODO: what data type 
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var balance int
-			var address uuid.UUID
-			err = rows.Scan(&address, &balance)
+			var account Account
+			err = rows.Scan(&account.Address, &account.Balance)
 			if err != nil {
 				return err
 			}
-			balances = append(balances, balance)
-			sources = append(sources, address)
+			accounts = append(accounts, account)
 		}
 	}
 
-	posting_amounts := make([]int, len(sources))
+	type Posting struct {
+		Source uuid.UUID
+		Amount int
+	}
+	postings := make([]Posting, len(accounts))
 
 	remaining := amount
-	for i := range sources { // remove money from accounts
-		// TODO: handle negative limit
-		posting_amount := Min(balances[i], amount)
-		posting_amounts[i] = posting_amount
+	for i, account := range accounts { // remove money from accounts
+		posting_amount := Min(account.Balance, amount)
+		postings[i].Amount = posting_amount
+		postings[i].Source = account.Address
 		remaining -= posting_amount
-		sql := "update accounts set balance = $1 where address = $2"
-		_, err := tx.Exec(context.Background(), sql, balances[i]-posting_amount, sources[i])
+		sql := "update accounts set balance = balance - $1 where address = $2"
+		_, err := tx.Exec(context.Background(), sql, posting_amount, account.Address)
 		if err != nil {
 			return err
 		}
@@ -130,10 +133,24 @@ func Transact(source, destination uuid.UUID, amount int /* TODO: what data type 
 		}
 	}
 
+	if remaining > 0 {
+		// WARN: this assumes the total balance - credits > negative_limit
+		// sql := "insert into credits as c values($1, -$2) on conflict on constraint credits_pkey do update set balance = c.balance - $2"
+		var credit_acc_id uuid.UUID
+		sql := "insert into accounts (wallet_id, balance) values ($1, $2) returning address"
+		row := tx.QueryRow(context.Background(), sql, source, -remaining)
+		err := row.Scan(&credit_acc_id)
+		if err != nil {
+			return err
+		}
+		postings = append(postings, Posting{credit_acc_id, remaining})
+	}
+
 	var dest_acc_id uuid.UUID
 	{
-		dest_update_sql := "insert into accounts (balance, wallet_id) values ($1, $2) returning address"
-		ac_row := tx.QueryRow(context.Background(), dest_update_sql, amount, destination)
+		// TODO: batch insert
+		dest_update_sql := "insert into accounts (wallet_id, balance) values ($1, $2) returning address"
+		ac_row := tx.QueryRow(context.Background(), dest_update_sql, destination, amount)
 		err = ac_row.Scan(&dest_acc_id)
 		if err != nil {
 			return err
@@ -150,9 +167,9 @@ func Transact(source, destination uuid.UUID, amount int /* TODO: what data type 
 		}
 	}
 
-	for i, source := range sources { // TODO: batch insert
+	for _, posting := range postings { // TODO: batch insert
 		insert_sql := "insert into postings (transaction_id, source, destination, amount) values ($1, $2, $3, $4)"
-		_, err = tx.Exec(context.Background(), insert_sql, tx_id, source, dest_acc_id, posting_amounts[i])
+		_, err = tx.Exec(context.Background(), insert_sql, tx_id, posting.Source, dest_acc_id, posting.Amount)
 		if err != nil {
 			return err
 		}
