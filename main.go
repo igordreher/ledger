@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -40,14 +41,20 @@ func main() {
 		}
 
 		txs := []Transaction{
-			{source, dest, amount},
-			{dest, source, amount / 2},
+			{source, dest, amount, nil},
+			{dest, source, amount / 2, nil},
 		}
 		ids, err := TransactBatch(txs...)
 		if err != nil {
 			log.Fatalln(err)
 		}
 		fmt.Println(ids)
+
+		r_ids, err := BatchRevert(ids[1], ids[0])
+		if err != nil {
+			log.Fatalln(err)
+		}
+		fmt.Println(r_ids)
 
 		// tx_id, err := Transact(source, dest, amount)
 		// if err != nil {
@@ -102,7 +109,10 @@ type Transaction struct {
 	Source      WalletId
 	Destination WalletId
 	Amount      int /* TODO: what data type should we use for precision? WARN*/
+	Metadata    map[string]interface{}
 }
+
+type Metadata map[string]interface{}
 
 func TransactBatch(txs ...Transaction) ([]int, error) {
 	if len(txs) == 0 {
@@ -142,7 +152,7 @@ func TransactBatch(txs ...Transaction) ([]int, error) {
 		sql := "select w.address, sum(a.balance) + w.negative_limit from wallets w" +
 			" join accounts a on a.wallet_id = w.address " +
 			" where w.address = any ($1) group by w.address"
-		err = QueryCollect(db_tx, func(row pgx.CollectableRow) error {
+		err = RunQuery(db_tx, func(row pgx.CollectableRow) error {
 			var wallet_id WalletId
 			var balance int
 			err := row.Scan(&wallet_id, &balance)
@@ -173,7 +183,7 @@ func TransactBatch(txs ...Transaction) ([]int, error) {
 	wallets := make(map[WalletId][]Account)
 	{
 		select_accounts_sql := "select address, balance, wallet_id from accounts where wallet_id = any ($1) order by created asc"
-		err = QueryCollect(db_tx, func(row pgx.CollectableRow) error {
+		err = RunQuery(db_tx, func(row pgx.CollectableRow) error {
 			var account Account
 			var wallet_id uuid.UUID
 			err := row.Scan(&account.Address, &account.Balance, &wallet_id)
@@ -185,13 +195,7 @@ func TransactBatch(txs ...Transaction) ([]int, error) {
 		}
 	}
 
-	type Posting struct {
-		Source      AccountId
-		Destination AccountId
-		Amount      int
-		TxIdIndex   int
-	}
-	var postings []Posting
+	var postings []PostingInsert
 	type AccountInsert struct {
 		WalletId WalletId
 		Address  AccountId
@@ -212,10 +216,10 @@ func TransactBatch(txs ...Transaction) ([]int, error) {
 				continue
 			}
 			posting_amount := Min(account.Balance, tx.Amount)
-			postings = append(postings, Posting{account.Address, dest_acc_id, posting_amount, tx_index})
+			postings = append(postings, PostingInsert{account.Address, dest_acc_id, posting_amount, tx_index})
 			remaining -= posting_amount
 			wallets[tx.Source][i].Balance -= posting_amount
-			account_updates[account.Address] += posting_amount
+			account_updates[account.Address] += wallets[tx.Source][i].Balance
 			if remaining == 0 {
 				break
 			}
@@ -226,7 +230,7 @@ func TransactBatch(txs ...Transaction) ([]int, error) {
 			credit_acc_id := AccountId(uuid.New())
 			account_inserts = append(account_inserts, AccountInsert{tx.Source, credit_acc_id, -remaining})
 			wallets[tx.Source] = append(wallets[tx.Source], Account{credit_acc_id, -remaining})
-			postings = append(postings, Posting{credit_acc_id, dest_acc_id, remaining, tx_index})
+			postings = append(postings, PostingInsert{credit_acc_id, dest_acc_id, remaining, tx_index})
 		}
 	}
 
@@ -247,59 +251,54 @@ func TransactBatch(txs ...Transaction) ([]int, error) {
 			return nil, err
 		}
 	}
-
-	{ // Batch update source accounts
-		acc_update_ids := make([]AccountId, len(account_updates))
-		acc_update_amounts := make([]int, len(account_updates))
-
-		i := 0
-		for id, amount := range account_updates {
-			acc_update_ids[i] = id
-			acc_update_amounts[i] = amount
-			i += 1
-		}
-
-		update_acc_sql := "update accounts a set balance = balance - na.value" +
-			" from (select unnest($1::uuid[]) as key, unnest($2::numeric[]) as value) as na" +
-			" where a.address = na.key"
-		_, err = conn.Exec(context.Background(), update_acc_sql, acc_update_ids, acc_update_amounts)
-		if err != nil {
-			log.Fatalln(err)
-		}
+	tx_ids, err := transact(db_tx, account_updates, txs, postings)
+	if err != nil {
+		return nil, err
 	}
 
-	tx_ids := make([]int, len(txs))
+	// { // Batch update source accounts
+	// 	acc_update_ids := make([]AccountId, len(account_updates))
+	// 	acc_update_amounts := make([]int, len(account_updates))
 
-	{ // insert transactions
-		args := make([]any, len(txs)*3)
-		b := strings.Builder{}
-		for i := range txs {
-			b.WriteString(fmt.Sprintf("($%d, $%d, $%d),", i*3+1, i*3+2, i*3+3))
-			args[i*3] = txs[i].Source
-			args[i*3+1] = txs[i].Destination
-			args[i*3+2] = txs[i].Amount
-		}
-		str := b.String()
-		str = str[:len(str)-1]
-		sql := fmt.Sprintf("insert into transactions (source, destination, amount) values %s returning id", str)
-		j := -1
-		err = QueryCollect(db_tx, func(row pgx.CollectableRow) error {
-			j++
-			return row.Scan(&tx_ids[j])
-		}, sql, args...)
-		if err != nil {
-			return nil, err
-		}
-	}
+	// 	i := 0
+	// 	for id, amount := range account_updates {
+	// 		acc_update_ids[i] = id
+	// 		acc_update_amounts[i] = amount
+	// 		i += 1
+	// 	}
 
-	for _, posting := range postings { // TODO: batch insert
-		insert_sql := "insert into postings (transaction_id, source, destination, amount) values ($1, $2, $3, $4)"
-		_, err = db_tx.Exec(context.Background(), insert_sql, tx_ids[posting.TxIdIndex],
-			posting.Source, posting.Destination, posting.Amount)
-		if err != nil {
-			return nil, err
-		}
-	}
+	// 	update_acc_sql := "update accounts a set balance = balance - na.value" +
+	// 		" from (select unnest($1::uuid[]) as key, unnest($2::numeric[]) as value) as na" +
+	// 		" where a.address = na.key"
+	// 	_, err = conn.Exec(context.Background(), update_acc_sql, acc_update_ids, acc_update_amounts)
+	// 	if err != nil {
+	// 		log.Fatalln(err)
+	// 	}
+	// }
+
+	// err = batchInsertTransactions(db_tx, &tx_ids, txs...)
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	// {
+	// 	args := make([]any, len(postings)*4)
+	// 	b := strings.Builder{}
+	// 	for i, posting := range postings { // TODO: batch insert
+	// 		b.WriteString(fmt.Sprintf("($%d, $%d, $%d, $%d),", i*4+1, i*4+2, i*4+3, i*4+4))
+	// 		args[i*4] = tx_ids[posting.TxIdIndex]
+	// 		args[i*4+1] = posting.Source
+	// 		args[i*4+2] = posting.Destination
+	// 		args[i*4+3] = posting.Amount
+	// 	}
+	// 	str := b.String()
+	// 	str = str[:len(str)-1]
+	// 	insert_sql := fmt.Sprintf("insert into postings (transaction_id, source, destination, amount) values %s", str)
+	// 	_, err = db_tx.Exec(context.Background(), insert_sql, args)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// }
 
 	err = db_tx.Commit(context.Background())
 	if err != nil {
@@ -460,6 +459,158 @@ func TransactWithTransaction(source, destination WalletId, amount int, ongoing_t
 	return tx_id, nil
 }
 
+func BatchRevert(tx_ids ...int) ([]int, error) {
+	if len(tx_ids) == 0 {
+		return nil, errors.New("empty array")
+	}
+
+	{
+		// Remove unique ids from tx_ids
+		unique_ids := make(map[int]bool)
+		list := []int{}
+		for _, id := range tx_ids {
+			if id <= 0 {
+				return nil, errors.New("invalid transaction id")
+			}
+			if _, value := unique_ids[id]; !value {
+				unique_ids[id] = true
+				list = append(list, id)
+			}
+		}
+		tx_ids = list
+	}
+
+	var wallet_ids []WalletId
+	{
+		var err error
+		sql := "select distinct unnest(array[source, destination]) from transactions where id = any ($1)"
+		wallet_ids, err = QueryCollect(conn, func(row pgx.CollectableRow) (WalletId, error) {
+			var wallet_id WalletId
+			err := row.Scan(&wallet_id)
+			return wallet_id, err
+		}, sql, tx_ids)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	db_tx, err := conn.Begin(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer db_tx.Rollback(context.Background())
+
+	err = LockWallets(db_tx, wallet_ids...)
+	if err != nil {
+		return nil, err
+	}
+
+	tx_index_map := make(map[int]int)
+	var txs []Transaction
+	{
+		sql := "select id, source, destination, amount, metadata from transactions where id = any($1) order by id asc"
+		i := 0
+		txs, err = QueryCollect(db_tx, func(row pgx.CollectableRow) (Transaction, error) {
+			var tx Transaction
+			var id int
+			var metadata Metadata
+			revert_metadata := make(Metadata)
+			err = row.Scan(&id, &tx.Destination, &tx.Source, &tx.Amount, &metadata) // NOTE: inverted destination and source
+
+			if metadata["reverted_by"] != nil {
+				return tx, errors.New("transaction already reverted")
+			}
+			if metadata["reverts"] != nil {
+				return tx, errors.New("transaction reverts another one")
+			}
+
+			revert_metadata["reverts"] = id
+			tx.Metadata = revert_metadata
+			tx_index_map[id] = i
+			i++
+			return tx, err
+		}, sql, tx_ids)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	type Posting struct {
+		Source AccountId
+		Dest   AccountId
+		Amount int
+		TxId   int
+	}
+
+	var account_ids []AccountId
+	var postings []Posting
+	{
+		sql := "select p.source, p.destination, p.amount, p.transaction_id from postings p " +
+			"join transactions t on t.id = p.transaction_id where p.transaction_id = any ($1) "
+		postings, err = QueryCollect(db_tx, func(row pgx.CollectableRow) (Posting, error) {
+			var posting Posting
+			// NOTE: inverted source and destination
+			err = row.Scan(&posting.Dest, &posting.Source, &posting.Amount, &posting.TxId)
+			account_ids = append(account_ids, posting.Source, posting.Dest)
+			return posting, err
+		}, sql, tx_ids)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	accounts := make(map[AccountId]int)
+	{
+		sql := "select address, balance from accounts a where address = any($1)"
+		err = RunQuery(db_tx, func(row pgx.CollectableRow) error {
+			var account_id AccountId
+			var balance int
+			err = row.Scan(&account_id, &balance)
+			accounts[account_id] = balance
+			return err
+		}, sql, account_ids)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	postings_insert := make([]PostingInsert, len(postings))
+	for i, posting := range postings {
+		accounts[posting.Source] -= posting.Amount
+		accounts[posting.Dest] += posting.Amount
+		postings_insert[i] = PostingInsert{posting.Source, posting.Dest, posting.Amount, tx_index_map[posting.TxId]}
+	}
+	for _, balance := range accounts {
+		if balance < 0 {
+			return nil, errors.New("unable to revert")
+		}
+	}
+
+	revert_tx_ids, err := transact(db_tx, accounts, txs, postings_insert)
+	if err != nil {
+		return nil, err
+	}
+
+	{ // add reverted_by metadata to transactions
+		sort.Ints(tx_ids) // WARN: this brakes if there are repeated tx_ids
+		sort.Ints(revert_tx_ids)
+		update_acc_sql := "update transactions t set metadata = jsonb_set(metadata, '{reverted_by}', to_jsonb(nt.value))" +
+			" from (select unnest($1::numeric[]) as key, unnest($2::numeric[]) as value) as nt" +
+			" where t.id = nt.key"
+		_, err := db_tx.Exec(context.Background(), update_acc_sql, tx_ids, revert_tx_ids)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	err = db_tx.Commit(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	return revert_tx_ids, nil
+}
+
 func RevertTransaction(tx_id int) (int, error) {
 	if tx_id <= 0 {
 		return -1, errors.New("invalid tx_id")
@@ -477,7 +628,7 @@ func RevertTransaction(tx_id int) (int, error) {
 		}
 	}
 
-	{ // TODO: check if tx was reverted or reverts another one
+	{
 		if metadata["reverted_by"] != 0 {
 			return -1, errors.New("transactions already reverted")
 		}
@@ -559,12 +710,91 @@ func RevertTransaction(tx_id int) (int, error) {
 	return revert_id, nil
 }
 
+type PostingInsert struct {
+	Source      AccountId
+	Destination AccountId
+	Amount      int
+	TxIdIndex   int
+}
+
+func transact(db pgx.Tx, account_updates map[AccountId]int, txs []Transaction, postings []PostingInsert) ([]int, error) {
+	{
+		acc_update_ids := make([]AccountId, len(account_updates))
+		acc_update_amounts := make([]int, len(account_updates))
+
+		i := 0
+		for id, amount := range account_updates {
+			acc_update_ids[i] = id
+			acc_update_amounts[i] = amount
+			i += 1
+		}
+
+		update_acc_sql := "update accounts a set balance = na.value" +
+			" from (select unnest($1::uuid[]) as key, unnest($2::numeric[]) as value) as na" +
+			" where a.address = na.key"
+		_, err := db.Exec(context.Background(), update_acc_sql, acc_update_ids, acc_update_amounts)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	empty_metadata := make(Metadata)
+	tx_ids := make([]int, len(txs))
+	{
+		args := make([]any, len(txs)*4)
+		b := strings.Builder{}
+		for i := range txs {
+			b.WriteString(fmt.Sprintf("($%d, $%d, $%d, $%d),", i*4+1, i*4+2, i*4+3, i*4+4))
+			args[i*4] = txs[i].Source
+			args[i*4+1] = txs[i].Destination
+			args[i*4+2] = txs[i].Amount
+			if txs[i].Metadata == nil {
+				args[i*4+3] = empty_metadata
+			} else {
+				args[i*4+3] = txs[i].Metadata
+			}
+		}
+		str := b.String()
+		str = str[:len(str)-1]
+		sql := fmt.Sprintf("insert into transactions (source, destination, amount, metadata) values %s returning id", str)
+		j := -1
+		err := RunQuery(db, func(row pgx.CollectableRow) error {
+			j++
+			return row.Scan(&tx_ids[j])
+		}, sql, args...)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	{
+		args := make([]any, len(postings)*4)
+		b := strings.Builder{}
+		for i, posting := range postings {
+			b.WriteString(fmt.Sprintf("($%d, $%d, $%d, $%d),", i*4+1, i*4+2, i*4+3, i*4+4))
+			args[i*4] = tx_ids[posting.TxIdIndex]
+			args[i*4+1] = posting.Source
+			args[i*4+2] = posting.Destination
+			args[i*4+3] = posting.Amount
+		}
+		str := b.String()
+		str = str[:len(str)-1]
+		insert_sql := fmt.Sprintf("insert into postings (transaction_id, source, destination, amount) values %s", str)
+		_, err := db.Exec(context.Background(), insert_sql, args...)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return tx_ids, nil
+}
+
 type Db interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }
 
-func RunQuery[T any](db Db, rowToFunc pgx.RowToFunc[T], query string, args ...any) ([]T, error) {
+func QueryCollect[T any](db Db, rowToFunc pgx.RowToFunc[T], query string, args ...any) ([]T, error) {
 	rows, err := db.Query(context.Background(), query, args...)
 	if err != nil {
 		return nil, err
@@ -573,7 +803,7 @@ func RunQuery[T any](db Db, rowToFunc pgx.RowToFunc[T], query string, args ...an
 	return t, err
 }
 
-func QueryCollect(db Db, fn func(row pgx.CollectableRow) error, query string, args ...any) error {
+func RunQuery(db Db, fn func(row pgx.CollectableRow) error, query string, args ...any) error {
 	rows, err := db.Query(context.Background(), query, args...)
 	if err != nil {
 		return err
@@ -588,7 +818,7 @@ func QueryCollect(db Db, fn func(row pgx.CollectableRow) error, query string, ar
 	return rows.Err()
 }
 
-func LockWallets(db Db, wallets ...WalletId) error {
+func LockWallets(db pgx.Tx, wallets ...WalletId) error {
 	// WARN: this doesnt prevent accounts from theese wallets to be altered or created. This is here to prevent this function to run concurrently on the same wallets
 	// NOTE: copied the idea from https://stackoverflow.com/a/52557413/13449544
 	// NOTE: this doensn't lock from read... TODO: should we lock from read?
