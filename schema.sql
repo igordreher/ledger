@@ -13,21 +13,21 @@ create table accounts
 	metadata jsonb not null default '{}'::jsonb,
 	balance numeric not null, -- how to prevent decimal?
 	created timestamptz not null default now(),
-	wallet_id uuid not null references wallets(address),
+	wallet_id uuid not null references wallets(address)
 --	credit bool not null default false,
 --	check ((credit is false and balance >= 0) or (credit is true and balance < 0))
 );
 
 create table transactions
 (
-	id serial primary key,
+	id uuid primary key default gen_random_uuid(),
 	metadata jsonb not null default '{}'::jsonb,
 	timestamp timestamptz not null default now()
 );
 
 create table postings
 (
-	id serial primary key,
+	id uuid primary key default gen_random_uuid(),
 	transaction_id int not null references transactions(id),
 	source uuid not null references accounts(address),
 	destination uuid not null references accounts(address),
@@ -37,8 +37,9 @@ create table postings
 
 create table revertions
 (
-	revert int not null references postings(id) unique,
-	reverted int not null references postings(id) unique,
+	revert uuid not null references postings(id) unique,
+	reverted uuid not null references postings(id) unique,
+	primary key (revert, reverted),
 	check (revert != reverted)
 );
 

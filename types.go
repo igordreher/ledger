@@ -12,6 +12,8 @@ var ZERO = NewBigInt(0)
 
 type AccountId uuid.UUID
 type WalletId uuid.UUID
+type PostingId uuid.UUID
+type TxId uuid.UUID
 
 func (id WalletId) String() string {
 	return uuid.UUID(id).String()
@@ -38,9 +40,31 @@ func (id *AccountId) Scan(src any) error {
 	return err
 }
 
-//	type BigInt struct {
-//		Int *big.Int
-//	}
+func (id TxId) String() string {
+	return uuid.UUID(id).String()
+}
+func (id PostingId) String() string {
+	return uuid.UUID(id).String()
+}
+
+func (id TxId) Value() (driver.Value, error) {
+	return uuid.UUID(id).Value()
+}
+func (id PostingId) Value() (driver.Value, error) {
+	return uuid.UUID(id).Value()
+}
+
+func (id *TxId) Scan(src any) error {
+	new_id, err := uuid.Parse(src.(string))
+	*id = TxId(new_id)
+	return err
+}
+func (id *PostingId) Scan(src any) error {
+	new_id, err := uuid.Parse(src.(string))
+	*id = PostingId(new_id)
+	return err
+}
+
 type BigInt big.Int
 
 func NewBigInt(i int64) *BigInt {
