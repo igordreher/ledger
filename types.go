@@ -87,3 +87,13 @@ func (b *BigInt) Set(x *BigInt) {
 	(*big.Int)(b).Set((*big.Int)(x))
 	return
 }
+
+func Min(a, b *BigInt) *BigInt {
+	x := NewBigInt(0)
+	if a.Cmp(b) == -1 {
+		x.Set(a)
+		return a
+	}
+	x.Set(b)
+	return b
+}
